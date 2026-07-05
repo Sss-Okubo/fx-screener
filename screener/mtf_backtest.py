@@ -1,19 +1,19 @@
 """MTFそろいシグナルの売買検証 (ルール変種の比較)
 
-エントリーは全変種共通: 15分/1時間/4時間足のトレンドが3つそろったバーの終値。
-比較する変種:
+エントリーは①〜⑧共通: 15分/1時間/4時間足のトレンドが3つそろったバーの終値。
 - ① 元ルール: そろいが崩れたら即決済 (中立でも決済)
-- ② 出口=15分逆転: 15分足がポジションと逆方向になるまで保有 (中立では保有継続)
-- ③ 出口=1時間崩れ: 1時間足がポジション方向でなくなったら決済 (15分足は無視)
-- ④ ② + 入口フレッシュ: 直前2時間(8バー)以上そろいが無かった場合のみ新規エントリー
-- ⑤ ③ + 入口フレッシュ: 同上
-- ⑥ 利確=BB3σ / 損切=SMA20−30pips: 15分足のボリンジャーバンド(20期間)+3σタッチで利確、
-  中心線(SMA20)から30pips逆行で損切 (トレーリング)。高値/安値でタッチ判定、同一バーは損切優先
+- ② 出口=15分逆転: 15分足がポジションと逆方向になるまで保有
+- ③ 出口=1時間崩れ: 1時間足がポジション方向でなくなったら決済
+- ④ ② + 入口フレッシュ(2h) / ⑤ ③ + 入口フレッシュ(2h)
+- ⑥ 利確=BB3σ / 損切=SMA20−30pips (トレーリング)
+- ⑦ 利確=BB3σ / 損切=建値−1.5×ATR14 (建値固定)
+- ⑧ 半分をBB3σで利確 → 残りはSMA20割れまでトレイル / 損切=建値−1.5×ATR14
+- ⑨ 1時間足ベース: 1時間/4時間/日足のそろいでエントリー、利確=1時間足BB3σ、
+  損切=建値−1.5×ATR14(1時間足)。検証期間は約1年 (他と期間が異なる点に注意)
 
-制約: yfinance の15分足は直近60日しか取得できないため、検証期間は約2ヶ月。
-1時間足は365日分を取得して 1時間/4時間足のEMAを十分にウォームアップさせる。
-進行中の1時間/4時間バーは、最新の15分終値でEMAを1ステップ仮更新して判定する
-(ライブ判定と同等の扱い)。建玉中は各変種の決済条件のみを監視する。
+制約: yfinance の15分足は直近60日しか取得できないため①〜⑧の検証期間は約2ヶ月。
+進行中の上位足バーは、最新の下位足終値でEMAを1ステップ仮更新して判定する。
+TP/SLは高値/安値タッチで判定しレベル価格で約定 (窓開けは寄付)。同一バーは損切優先。
 """
 from __future__ import annotations
 
@@ -40,28 +40,32 @@ VARIANTS: list[tuple[str, str, int]] = [
     ("④ ②+入口フレッシュ(2h)", "m15", 8),
     ("⑤ ③+入口フレッシュ(2h)", "h1", 8),
 ]
-BB_NAME = "⑥ 利確BB3σ/損切SMA-30p"
-BB_SPAN = 20      # ボリンジャーバンドの期間 (15分足)
+NAME_BB = "⑥ 利確BB3σ/損切SMA-30p"
+NAME_ATR = "⑦ 利確BB3σ/損切1.5ATR固定"
+NAME_HALF = "⑧ 半分利確+中心線トレイル"
+NAME_H1 = "⑨ 1時間足ベース(検証1年)"
+BB_SPAN = 20      # ボリンジャーバンドの期間
 BB_SIGMA = 3.0    # 利確バンドのシグマ
-SL_PIPS = 30.0    # 損切: SMA20 からの逆行幅 (pips)
+SL_PIPS = 30.0    # ⑥の損切: SMA20 からの逆行幅 (pips)
+ATR_MULT = 1.5    # ⑦⑧⑨の損切: 建値からの ATR 倍率
 
 
-def _dirs_15m(c15: pd.Series) -> np.ndarray:
-    e20 = c15.ewm(span=20, adjust=False).mean().to_numpy(float)
-    e50 = c15.ewm(span=50, adjust=False).mean().to_numpy(float)
-    p = c15.to_numpy(float)
+def _dirs_self(close: pd.Series) -> np.ndarray:
+    """その足自身のEMA20/50によるトレンド方向"""
+    e20 = close.ewm(span=20, adjust=False).mean().to_numpy(float)
+    e50 = close.ewm(span=50, adjust=False).mean().to_numpy(float)
+    p = close.to_numpy(float)
     return np.where((p > e20) & (e20 > e50), 1,
                     np.where((p < e20) & (e20 < e50), -1, 0))
 
 
-def _dirs_higher(c15: pd.Series, c1h: pd.Series, freq: str) -> np.ndarray:
-    """上位足の方向。完了バーのEMAに、進行中バーの15分終値で1ステップ仮更新"""
-    bar_close = c1h.resample(freq).last().dropna() if freq != "1h" else c1h
-    bars = c15.index.floor(freq)
-    p = c15.to_numpy(float)
+def _dirs_higher(base: pd.Series, upper_close: pd.Series,
+                 bars: pd.Index) -> np.ndarray:
+    """上位足の方向。完了バーのEMAに、進行中バーは下位足終値で1ステップ仮更新"""
+    p = base.to_numpy(float)
     emas = []
     for span in (20, 50):
-        ema = bar_close.ewm(span=span, adjust=False).mean()
+        ema = upper_close.ewm(span=span, adjust=False).mean()
         prev = ema.shift(1).reindex(bars, method="ffill").to_numpy(float)
         a = 2 / (span + 1)
         emas.append(a * p + (1 - a) * prev)
@@ -70,13 +74,21 @@ def _dirs_higher(c15: pd.Series, c1h: pd.Series, freq: str) -> np.ndarray:
                     np.where((p < e20) & (e20 < e50), -1, 0))
 
 
+def _atr(df: pd.DataFrame, period: int = 14) -> np.ndarray:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean().to_numpy(float)
+
+
 def _simulate(c15: pd.Series, sig: np.ndarray, d15: np.ndarray, d1h: np.ndarray,
               cost: float, exit_mode: str, fresh_bars: int) -> list[dict]:
+    """①〜⑤: 終値ベースの決済"""
     prices = c15.to_numpy(float)
     times = c15.index
     trades: list[dict] = []
     pos, p_in, t_in = 0, 0.0, None
-    last_nz = -10 ** 9  # 直近で sig != 0 だったバーの位置
+    last_nz = -10 ** 9
 
     for i in range(len(prices)):
         s = int(sig[i])
@@ -96,13 +108,12 @@ def _simulate(c15: pd.Series, sig: np.ndarray, d15: np.ndarray, d1h: np.ndarray,
                 })
                 pos = 0
         if pos == 0 and s != 0:
-            # 新規はそろいの初回バーのみ。フレッシュ条件は直前の非そろい期間で判定
             run_start = i == 0 or int(sig[i - 1]) != s
             if run_start and (i - last_nz - 1) >= fresh_bars:
                 pos, p_in, t_in = s, prices[i], times[i]
         if s != 0:
             last_nz = i
-    if pos != 0:  # 期間末で強制決済
+    if pos != 0:
         trades.append({
             "entry": t_in, "exit": times[-1], "side": pos,
             "ret": (prices[-1] / p_in - 1) * pos - cost,
@@ -112,29 +123,24 @@ def _simulate(c15: pd.Series, sig: np.ndarray, d15: np.ndarray, d1h: np.ndarray,
     return trades
 
 
-def _simulate_bb(df15: pd.DataFrame, sig: np.ndarray, pip: float,
-                 cost: float) -> list[dict]:
-    """⑥: 利確=BB+3σタッチ、損切=SMA20から30pips逆行 (トレーリング)。
-
-    高値/安値でタッチ判定し、約定はレベル価格 (バーの寄付がレベルを飛び越えて
-    いた場合は寄付価格)。同一バーで利確・損切の両方に届いた場合は損切を優先。
-    """
-    c = df15["Close"].to_numpy(float)
-    o = df15["Open"].to_numpy(float)
-    h = df15["High"].to_numpy(float)
-    lo_ = df15["Low"].to_numpy(float)
-    times = df15.index
-    close_s = df15["Close"]
-    sma = close_s.rolling(BB_SPAN).mean().to_numpy(float)
-    sd = close_s.rolling(BB_SPAN).std(ddof=0).to_numpy(float)
-    upper = sma + BB_SIGMA * sd
-    lower = sma - BB_SIGMA * sd
-    sl_off = SL_PIPS * pip
+def _simulate_tp_sl(df: pd.DataFrame, sig: np.ndarray, pip: float, cost: float,
+                    sl_mode: str) -> list[dict]:
+    """⑥⑦⑨: 利確=BB+3σタッチ、損切=sl_mode ("sma30"=SMA20-30pipsトレーリング /
+    "atr"=建値−1.5×ATR固定)"""
+    c = df["Close"].to_numpy(float)
+    o = df["Open"].to_numpy(float)
+    h = df["High"].to_numpy(float)
+    l = df["Low"].to_numpy(float)
+    times = df.index
+    sma = df["Close"].rolling(BB_SPAN).mean().to_numpy(float)
+    sd = df["Close"].rolling(BB_SPAN).std(ddof=0).to_numpy(float)
+    upper, lower = sma + BB_SIGMA * sd, sma - BB_SIGMA * sd
+    atr = _atr(df)
 
     trades: list[dict] = []
-    pos, p_in, t_in, i_in = 0, 0.0, None, -1
+    pos, p_in, t_in, i_in, stop0 = 0, 0.0, None, -1, 0.0
 
-    def _close_trade(i: int, price: float, reason: str) -> None:
+    def close_trade(i, price, reason):
         nonlocal pos
         trades.append({
             "entry": t_in, "exit": times[i], "side": pos,
@@ -146,32 +152,102 @@ def _simulate_bb(df15: pd.DataFrame, sig: np.ndarray, pip: float,
 
     for i in range(len(c)):
         if pos != 0 and i > i_in and not math.isnan(sma[i]):
-            if pos == 1:
-                stop, tp = sma[i] - sl_off, upper[i]
-                if o[i] <= stop:
-                    _close_trade(i, o[i], "損切")
-                elif lo_[i] <= stop:
-                    _close_trade(i, stop, "損切")
-                elif o[i] >= tp:
-                    _close_trade(i, o[i], "利確")
-                elif h[i] >= tp:
-                    _close_trade(i, tp, "利確")
+            if sl_mode == "sma30":
+                stop = sma[i] - pos * SL_PIPS * pip
             else:
-                stop, tp = sma[i] + sl_off, lower[i]
+                stop = stop0
+            tp = upper[i] if pos == 1 else lower[i]
+            if pos == 1:
+                if o[i] <= stop:
+                    close_trade(i, o[i], "損切")
+                elif l[i] <= stop:
+                    close_trade(i, stop, "損切")
+                elif o[i] >= tp:
+                    close_trade(i, o[i], "利確")
+                elif h[i] >= tp:
+                    close_trade(i, tp, "利確")
+            else:
                 if o[i] >= stop:
-                    _close_trade(i, o[i], "損切")
+                    close_trade(i, o[i], "損切")
                 elif h[i] >= stop:
-                    _close_trade(i, stop, "損切")
+                    close_trade(i, stop, "損切")
                 elif o[i] <= tp:
-                    _close_trade(i, o[i], "利確")
-                elif lo_[i] <= tp:
-                    _close_trade(i, tp, "利確")
+                    close_trade(i, o[i], "利確")
+                elif l[i] <= tp:
+                    close_trade(i, tp, "利確")
         if pos == 0:
             s = int(sig[i])
-            if s != 0 and (i == 0 or int(sig[i - 1]) != s):
+            if s != 0 and (i == 0 or int(sig[i - 1]) != s) and not math.isnan(atr[i]):
                 pos, p_in, t_in, i_in = s, c[i], times[i], i
+                stop0 = p_in - s * ATR_MULT * atr[i]
     if pos != 0:
-        _close_trade(len(c) - 1, c[-1], "強制")
+        close_trade(len(c) - 1, c[-1], "強制")
+    return trades
+
+
+def _simulate_half_trail(df: pd.DataFrame, sig: np.ndarray, pip: float,
+                         cost: float) -> list[dict]:
+    """⑧: 損切=建値−1.5×ATR固定。BB+3σタッチで半分利確、残りはSMA20割れで決済"""
+    c = df["Close"].to_numpy(float)
+    o = df["Open"].to_numpy(float)
+    h = df["High"].to_numpy(float)
+    l = df["Low"].to_numpy(float)
+    times = df.index
+    sma = df["Close"].rolling(BB_SPAN).mean().to_numpy(float)
+    sd = df["Close"].rolling(BB_SPAN).std(ddof=0).to_numpy(float)
+    upper, lower = sma + BB_SIGMA * sd, sma - BB_SIGMA * sd
+    atr = _atr(df)
+
+    trades: list[dict] = []
+    pos, p_in, t_in, i_in, stop0 = 0, 0.0, None, -1, 0.0
+    half_ret = None  # 半分利確済みならそのリターン
+
+    def close_trade(i, price, reason):
+        nonlocal pos, half_ret
+        r2 = (price / p_in - 1) * pos
+        ret = r2 - cost if half_ret is None else 0.5 * half_ret + 0.5 * r2 - cost
+        trades.append({
+            "entry": t_in, "exit": times[i], "side": pos, "ret": ret,
+            "hours": (times[i] - t_in).total_seconds() / 3600,
+            "reason": reason,
+        })
+        pos, half_ret = 0, None
+
+    for i in range(len(c)):
+        if pos != 0 and i > i_in and not math.isnan(sma[i]):
+            tp = upper[i] if pos == 1 else lower[i]
+            if pos == 1:
+                hit_sl = o[i] <= stop0 or l[i] <= stop0
+                sl_px = min(o[i], stop0) if o[i] <= stop0 else stop0
+                hit_tp = o[i] >= tp or h[i] >= tp
+                tp_px = max(o[i], tp) if o[i] >= tp else tp
+                hit_trail = o[i] <= sma[i] or l[i] <= sma[i]
+                trail_px = min(o[i], sma[i]) if o[i] <= sma[i] else sma[i]
+            else:
+                hit_sl = o[i] >= stop0 or h[i] >= stop0
+                sl_px = max(o[i], stop0) if o[i] >= stop0 else stop0
+                hit_tp = o[i] <= tp or l[i] <= tp
+                tp_px = min(o[i], tp) if o[i] <= tp else tp
+                hit_trail = o[i] >= sma[i] or h[i] >= sma[i]
+                trail_px = max(o[i], sma[i]) if o[i] >= sma[i] else sma[i]
+
+            if half_ret is None:
+                if hit_sl:
+                    close_trade(i, sl_px, "損切")
+                elif hit_tp:
+                    half_ret = (tp_px / p_in - 1) * pos  # 半分利確、残り継続
+            else:
+                if hit_sl:
+                    close_trade(i, sl_px, "半利確→損切")
+                elif hit_trail:
+                    close_trade(i, trail_px, "半利確→トレイル")
+        if pos == 0:
+            s = int(sig[i])
+            if s != 0 and (i == 0 or int(sig[i - 1]) != s) and not math.isnan(atr[i]):
+                pos, p_in, t_in, i_in = s, c[i], times[i], i
+                stop0 = p_in - s * ATR_MULT * atr[i]
+    if pos != 0:
+        close_trade(len(c) - 1, c[-1], "強制")
     return trades
 
 
@@ -179,7 +255,9 @@ def _ohlc(data: pd.DataFrame, ticker: str, single: bool) -> pd.DataFrame | None:
     try:
         df = data if single else data[ticker]
         df = df.dropna(subset=["Close"])
-        return df.tz_convert("UTC") if df.index.tz is not None else df
+        # 日足はtzなしで返るためUTCとして扱い、時間足と比較可能にする
+        return (df.tz_localize("UTC") if df.index.tz is None
+                else df.tz_convert("UTC"))
     except (KeyError, TypeError):
         return None
 
@@ -211,23 +289,32 @@ def run(args: argparse.Namespace) -> None:
     logger.info("1時間足を取得中 (365日分)")
     d1h = yf.download(tickers, period="365d", interval="1h", group_by="ticker",
                       auto_adjust=True, threads=True, progress=False)
+    logger.info("日足を取得中 (2年分)")
+    d1d = yf.download(tickers, period="2y", interval="1d", group_by="ticker",
+                      auto_adjust=True, threads=True, progress=False)
 
-    names = [name for name, _, _ in VARIANTS] + [BB_NAME]
+    names = ([name for name, _, _ in VARIANTS]
+             + [NAME_BB, NAME_ATR, NAME_HALF, NAME_H1])
     all_trades: dict[str, list[dict]] = {name: [] for name in names}
     period_start, period_end = None, None
+    h1_start, h1_end = None, None
     for _, u in uni.iterrows():
         df15 = _ohlc(d15, u["ticker"], single)
         df1h = _ohlc(d1h, u["ticker"], single)
+        df1d = _ohlc(d1d, u["ticker"], single)
         if df15 is None or df1h is None or len(df15) < 200:
             logger.warning("%s: データ不足のためスキップ", u["pair"])
             continue
+        pip = 0.01 if u["quote"] == "JPY" else 0.0001
         c15, c1h = df15["Close"], df1h["Close"]
         period_start = min(period_start or c15.index[0], c15.index[0])
         period_end = max(period_end or c15.index[-1], c15.index[-1])
 
-        dir15 = _dirs_15m(c15)
-        dir1h = _dirs_higher(c15, c1h, "1h")
-        dir4h = _dirs_higher(c15, c1h, "4h")
+        # ---- ①〜⑧: 15分足ベース ----
+        dir15 = _dirs_self(c15)
+        dir1h = _dirs_higher(c15, c1h, c15.index.floor("1h"))
+        c4h = c1h.resample("4h").last().dropna()
+        dir4h = _dirs_higher(c15, c4h, c15.index.floor("4h"))
         sig = np.where((dir15 == 1) & (dir1h == 1) & (dir4h == 1), 1,
                        np.where((dir15 == -1) & (dir1h == -1) & (dir4h == -1), -1, 0))
 
@@ -236,26 +323,44 @@ def run(args: argparse.Namespace) -> None:
             for t in trades:
                 t["pair"] = u["pair"]
             all_trades[name] += trades
-
-        pip = 0.01 if u["quote"] == "JPY" else 0.0001
-        trades = _simulate_bb(df15, sig, pip, cost)
+        for name, sl_mode in [(NAME_BB, "sma30"), (NAME_ATR, "atr")]:
+            trades = _simulate_tp_sl(df15, sig, pip, cost, sl_mode)
+            for t in trades:
+                t["pair"] = u["pair"]
+            all_trades[name] += trades
+        trades = _simulate_half_trail(df15, sig, pip, cost)
         for t in trades:
             t["pair"] = u["pair"]
-        all_trades[BB_NAME] += trades
+        all_trades[NAME_HALF] += trades
+
+        # ---- ⑨: 1時間足ベース (1h/4h/日足のそろい) ----
+        if df1d is not None and len(df1d) > 60:
+            h1_start = min(h1_start or c1h.index[0], c1h.index[0])
+            h1_end = max(h1_end or c1h.index[-1], c1h.index[-1])
+            dh1 = _dirs_self(c1h)
+            dh4 = _dirs_higher(c1h, c4h, c1h.index.floor("4h"))
+            c1d = df1d["Close"]
+            dhd = _dirs_higher(c1h, c1d, c1h.index.normalize())
+            sig1h = np.where((dh1 == 1) & (dh4 == 1) & (dhd == 1), 1,
+                             np.where((dh1 == -1) & (dh4 == -1) & (dhd == -1), -1, 0))
+            trades = _simulate_tp_sl(df1h, sig1h, pip, cost, "atr")
+            for t in trades:
+                t["pair"] = u["pair"]
+            all_trades[NAME_H1] += trades
 
     if not any(all_trades.values()):
         logger.error("トレードが1件も発生しませんでした")
         return
 
-    # 変種比較表
     lines = [
         f"# MTFそろい売買検証 (ルール変種比較) {run_date}",
         "",
-        "エントリーは全変種共通: 3つの足がそろったバーの終値 (④⑤は直前2時間以上の非そろいが条件)。",
-        f"⑥は利確=15分足BB({BB_SPAN}期間)+{BB_SIGMA:.0f}σタッチ、"
-        f"損切=SMA{BB_SPAN}から{SL_PIPS:.0f}pips逆行 (トレーリング、同一バーは損切優先)。",
-        f"検証期間: {period_start:%Y-%m-%d} 〜 {period_end:%Y-%m-%d} "
-        f"(約{(period_end - period_start).days}日間 ／ yfinanceの15分足の上限)",
+        "①〜⑧のエントリー: 15分/1時間/4時間足がそろったバーの終値 (検証約2ヶ月)。",
+        "⑨のエントリー: 1時間/4時間/日足がそろった1時間足バーの終値 (検証約1年)。",
+        f"利確=BB({BB_SPAN}期間)+{BB_SIGMA:.0f}σタッチ ／ 損切=⑥はSMA{BB_SPAN}−{SL_PIPS:.0f}pips(トレーリング)、"
+        f"⑦⑧⑨は建値−{ATR_MULT}×ATR14(固定) ／ ⑧は半分利確後SMA{BB_SPAN}割れまでトレイル。",
+        f"検証期間: ①〜⑧ {period_start:%Y-%m-%d}〜{period_end:%m-%d} ／ "
+        f"⑨ {h1_start:%Y-%m-%d}〜{h1_end:%m-%d}",
         f"取引コスト: 往復 {args.cost_bp:.1f}bp ／ 1トレード=固定ロット、リターンは単純合算",
         "",
         "## 変種比較 (全10ペア合算)",
@@ -270,41 +375,41 @@ def run(args: argparse.Namespace) -> None:
             f"| {s['total'] * 100:+.2f}% | {s['total_gross'] * 100:+.2f}% "
             f"| {s['hours']:.1f}h |")
 
-    # ⑥の決済内訳とペア別
-    bdf = pd.DataFrame(all_trades[BB_NAME])
-    reason_counts = bdf["reason"].value_counts()
-    reason_ret = bdf.groupby("reason")["ret"].mean() * 10000
-    lines += ["", f"## {BB_NAME} の決済内訳", "",
-              "| 決済理由 | 回数 | 割合 | 平均リターン |",
-              "|---|---:|---:|---:|"]
-    for reason in ["利確", "損切", "強制"]:
-        if reason in reason_counts:
-            n = int(reason_counts[reason])
-            lines.append(f"| {reason} | {n} | {n / len(bdf) * 100:.1f}% "
-                         f"| {reason_ret[reason]:+.1f}bp |")
+    # 新変種の決済内訳
+    for name in [NAME_ATR, NAME_HALF, NAME_H1]:
+        tdf = pd.DataFrame(all_trades[name])
+        if tdf.empty:
+            continue
+        lines += ["", f"## {name} の決済内訳", "",
+                  "| 決済理由 | 回数 | 割合 | 平均リターン |", "|---|---:|---:|---:|"]
+        for reason, g in tdf.groupby("reason"):
+            lines.append(f"| {reason} | {len(g)} | {len(g) / len(tdf) * 100:.1f}% "
+                         f"| {g['ret'].mean() * 10000:+.1f}bp |")
 
-    lines += ["", f"## ペア別内訳 ({BB_NAME} / コスト後)", "",
-              "| ペア | 回数 | 買/売 | 勝率 | 利確率 | 平均 | 合計 | 平均保有 |",
-              "|---|---:|---|---:|---:|---:|---:|---:|"]
+    # 最良の新変種のペア別内訳
+    best_name = max([NAME_ATR, NAME_HALF, NAME_H1],
+                    key=lambda n: _summary(all_trades[n], cost)["total"])
+    bdf = pd.DataFrame(all_trades[best_name])
+    lines += ["", f"## ペア別内訳 (新変種で最良: {best_name} / コスト後)", "",
+              "| ペア | 回数 | 買/売 | 勝率 | 平均 | 合計 | 平均保有 |",
+              "|---|---:|---|---:|---:|---:|---:|"]
     for pair, g in bdf.groupby("pair"):
         rets = g["ret"].to_numpy()
         buys = int((g["side"] == 1).sum())
-        tp_rate = (g["reason"] == "利確").mean()
         lines.append(
             f"| {pair} | {len(g)} | {buys}/{len(g) - buys} "
-            f"| {(rets > 0).mean() * 100:.0f}% | {tp_rate * 100:.0f}% "
-            f"| {rets.mean() * 10000:+.1f}bp "
+            f"| {(rets > 0).mean() * 100:.0f}% | {rets.mean() * 10000:+.1f}bp "
             f"| {rets.sum() * 100:+.2f}% | {g['hours'].mean():.1f}h |")
 
     lines += [
         "",
         "## 注意事項",
         "",
-        "- **検証期間は約2ヶ月のみ** (yfinanceの15分足は直近60日が上限)。この期間の相場環境に強く依存し、統計的な確度は低い",
-        "- ①〜⑤は終値ベースの約定。⑥のTP/SLは高値/安値タッチで判定しレベル価格で約定 (窓開けは寄付価格)。スリッページ未考慮",
+        "- ①〜⑧の検証期間は約2ヶ月のみ (yfinanceの15分足は直近60日が上限)。⑨は約1年だが期間が異なるため単純比較不可",
+        "- ①〜⑤は終値ベースの約定。⑥〜⑨のTP/SLは高値/安値タッチで判定しレベル価格で約定 (窓開けは寄付)。同一バーは損切優先。スリッページ未考慮",
+        "- ⑧の往復コストは全量に1回分で近似 (分割決済の追加コストは未考慮)",
         "- スワップ損益は未考慮",
-        "- 上位足の進行中バーは15分終値でEMAを仮更新して判定 (ライブ判定に近い扱いだが完全一致ではない)",
-        "- 建玉中は各変種の決済条件のみを監視し、逆方向のそろいが出ても決済条件を満たすまで保有",
+        "- 上位足の進行中バーは下位足終値でEMAを仮更新して判定 (ライブ判定に近い扱いだが完全一致ではない)",
         "- 期間末の未決済ポジションは最終バーで強制決済として集計",
         "- 過去の成績は将来の成果を保証しない。投資判断は自己責任で",
     ]
