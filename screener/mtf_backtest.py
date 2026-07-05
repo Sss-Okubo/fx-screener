@@ -43,7 +43,9 @@ VARIANTS: list[tuple[str, str, int]] = [
 NAME_BB = "⑥ 利確BB3σ/損切SMA-30p"
 NAME_ATR = "⑦ 利確BB3σ/損切1.5ATR固定"
 NAME_HALF = "⑧ 半分利確+中心線トレイル"
-NAME_H1 = "⑨ 1時間足ベース(検証1年)"
+NAME_H1 = "⑨ TP=BB3σ/SL=1.5ATR"
+NAME_H1_ALIGN = "⑩ そろい崩れで即決済"
+NAME_H1_REV = "⑪ 1時間足逆転まで保有"
 BB_SPAN = 20      # ボリンジャーバンドの期間
 BB_SIGMA = 3.0    # 利確バンドのシグマ
 SL_PIPS = 30.0    # ⑥の損切: SMA20 からの逆行幅 (pips)
@@ -286,15 +288,16 @@ def run(args: argparse.Namespace) -> None:
     logger.info("15分足を取得中 (60日分)")
     d15 = yf.download(tickers, period="60d", interval="15m", group_by="ticker",
                       auto_adjust=True, threads=True, progress=False)
-    logger.info("1時間足を取得中 (365日分)")
-    d1h = yf.download(tickers, period="365d", interval="1h", group_by="ticker",
+    logger.info("1時間足を取得中 (730日分)")
+    d1h = yf.download(tickers, period="730d", interval="1h", group_by="ticker",
                       auto_adjust=True, threads=True, progress=False)
-    logger.info("日足を取得中 (2年分)")
-    d1d = yf.download(tickers, period="2y", interval="1d", group_by="ticker",
+    logger.info("日足を取得中 (3年分)")
+    d1d = yf.download(tickers, period="3y", interval="1d", group_by="ticker",
                       auto_adjust=True, threads=True, progress=False)
 
-    names = ([name for name, _, _ in VARIANTS]
-             + [NAME_BB, NAME_ATR, NAME_HALF, NAME_H1])
+    names_15m = [name for name, _, _ in VARIANTS] + [NAME_BB, NAME_ATR, NAME_HALF]
+    names_1h = [NAME_H1, NAME_H1_ALIGN, NAME_H1_REV]
+    names = names_15m + names_1h
     all_trades: dict[str, list[dict]] = {name: [] for name in names}
     period_start, period_end = None, None
     h1_start, h1_end = None, None
@@ -333,7 +336,7 @@ def run(args: argparse.Namespace) -> None:
             t["pair"] = u["pair"]
         all_trades[NAME_HALF] += trades
 
-        # ---- ⑨: 1時間足ベース (1h/4h/日足のそろい) ----
+        # ---- ⑨⑩⑪: 1時間足ベース (1h/4h/日足のそろい、上位足版の通知と同じシグナル) ----
         if df1d is not None and len(df1d) > 60:
             h1_start = min(h1_start or c1h.index[0], c1h.index[0])
             h1_end = max(h1_end or c1h.index[-1], c1h.index[-1])
@@ -343,40 +346,52 @@ def run(args: argparse.Namespace) -> None:
             dhd = _dirs_higher(c1h, c1d, c1h.index.normalize())
             sig1h = np.where((dh1 == 1) & (dh4 == 1) & (dhd == 1), 1,
                              np.where((dh1 == -1) & (dh4 == -1) & (dhd == -1), -1, 0))
-            trades = _simulate_tp_sl(df1h, sig1h, pip, cost, "atr")
-            for t in trades:
-                t["pair"] = u["pair"]
-            all_trades[NAME_H1] += trades
+            for name, trades in [
+                (NAME_H1, _simulate_tp_sl(df1h, sig1h, pip, cost, "atr")),
+                (NAME_H1_ALIGN, _simulate(c1h, sig1h, dh1, dh4, cost, "align", 0)),
+                (NAME_H1_REV, _simulate(c1h, sig1h, dh1, dh4, cost, "m15", 0)),
+            ]:
+                for t in trades:
+                    t["pair"] = u["pair"]
+                all_trades[name] += trades
 
     if not any(all_trades.values()):
         logger.error("トレードが1件も発生しませんでした")
         return
 
+    def _rows(name_list):
+        rows = ["| 変種 | 回数 | 勝率 | 平均 | 合計(コスト後) | 合計(コスト前) | 平均保有 |",
+                "|---|---:|---:|---:|---:|---:|---:|"]
+        for name in name_list:
+            s = _summary(all_trades[name], cost)
+            rows.append(
+                f"| {name} | {s['trades']} | {s['win'] * 100:.1f}% | {s['avg_bp']:+.1f}bp "
+                f"| {s['total'] * 100:+.2f}% | {s['total_gross'] * 100:+.2f}% "
+                f"| {s['hours']:.1f}h |")
+        return rows
+
     lines = [
         f"# MTFそろい売買検証 (ルール変種比較) {run_date}",
         "",
-        "①〜⑧のエントリー: 15分/1時間/4時間足がそろったバーの終値 (検証約2ヶ月)。",
-        "⑨のエントリー: 1時間/4時間/日足がそろった1時間足バーの終値 (検証約1年)。",
+        "①〜⑧のエントリー: 15分/1時間/4時間足がそろったバーの終値。",
+        "⑨〜⑪のエントリー: 1時間/4時間/日足がそろった1時間足バーの終値 (上位足版の通知と同じシグナル)。",
         f"利確=BB({BB_SPAN}期間)+{BB_SIGMA:.0f}σタッチ ／ 損切=⑥はSMA{BB_SPAN}−{SL_PIPS:.0f}pips(トレーリング)、"
         f"⑦⑧⑨は建値−{ATR_MULT}×ATR14(固定) ／ ⑧は半分利確後SMA{BB_SPAN}割れまでトレイル。",
-        f"検証期間: ①〜⑧ {period_start:%Y-%m-%d}〜{period_end:%m-%d} ／ "
-        f"⑨ {h1_start:%Y-%m-%d}〜{h1_end:%m-%d}",
+        f"検証期間: ①〜⑧ {period_start:%Y-%m-%d}〜{period_end:%m-%d} (15分足の上限) ／ "
+        f"⑨〜⑪ {h1_start:%Y-%m-%d}〜{h1_end:%m-%d} (1時間足の上限)",
         f"取引コスト: 往復 {args.cost_bp:.1f}bp ／ 1トレード=固定ロット、リターンは単純合算",
         "",
-        "## 変種比較 (全10ペア合算)",
+        "## 15分足ベース (①〜⑧、約2ヶ月)",
         "",
-        "| 変種 | 回数 | 勝率 | 平均 | 合計(コスト後) | 合計(コスト前) | 平均保有 |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        *_rows(names_15m),
+        "",
+        "## 1時間足ベース (⑨〜⑪、約2年)",
+        "",
+        *_rows(names_1h),
     ]
-    for name in names:
-        s = _summary(all_trades[name], cost)
-        lines.append(
-            f"| {name} | {s['trades']} | {s['win'] * 100:.1f}% | {s['avg_bp']:+.1f}bp "
-            f"| {s['total'] * 100:+.2f}% | {s['total_gross'] * 100:+.2f}% "
-            f"| {s['hours']:.1f}h |")
 
-    # 新変種の決済内訳
-    for name in [NAME_ATR, NAME_HALF, NAME_H1]:
+    # 1時間足ベース変種の決済内訳
+    for name in names_1h:
         tdf = pd.DataFrame(all_trades[name])
         if tdf.empty:
             continue
@@ -386,11 +401,10 @@ def run(args: argparse.Namespace) -> None:
             lines.append(f"| {reason} | {len(g)} | {len(g) / len(tdf) * 100:.1f}% "
                          f"| {g['ret'].mean() * 10000:+.1f}bp |")
 
-    # 最良の新変種のペア別内訳
-    best_name = max([NAME_ATR, NAME_HALF, NAME_H1],
-                    key=lambda n: _summary(all_trades[n], cost)["total"])
+    # 最良の1時間足ベース変種のペア別内訳
+    best_name = max(names_1h, key=lambda n: _summary(all_trades[n], cost)["total"])
     bdf = pd.DataFrame(all_trades[best_name])
-    lines += ["", f"## ペア別内訳 (新変種で最良: {best_name} / コスト後)", "",
+    lines += ["", f"## ペア別内訳 (1時間足ベースで最良: {best_name} / コスト後)", "",
               "| ペア | 回数 | 買/売 | 勝率 | 平均 | 合計 | 平均保有 |",
               "|---|---:|---|---:|---:|---:|---:|"]
     for pair, g in bdf.groupby("pair"):

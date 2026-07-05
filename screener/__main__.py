@@ -91,7 +91,7 @@ def main() -> None:
     p_bt.add_argument("--force-refresh", action="store_true", help="キャッシュを無視して再取得")
     p_bt.set_defaults(func=backtest.run)
 
-    p_mtf = sub.add_parser("mtf", help="15分/1時間/4時間足のトレンドそろい判定")
+    p_mtf = sub.add_parser("mtf", help="1時間/4時間/日足のトレンドそろい判定")
     p_mtf.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
     p_mtf.add_argument("--limit", type=int, help="ペア数を制限 (テスト用)")
     p_mtf.add_argument("--no-notify", action="store_true", help="通知を送らない")

@@ -1,11 +1,13 @@
-"""マルチタイムフレーム (15分/1時間/4時間) のトレンドそろい判定
+"""マルチタイムフレーム (1時間/4時間/日足) のトレンドそろい判定
 
 各時間足のトレンドを EMA で判定し、3つの足が同方向のペアを抽出する:
 - 上昇: 終値 > EMA20 > EMA50
 - 下降: 終値 < EMA20 < EMA50
 - それ以外は中立
 
-4時間足は yfinance の1時間足をリサンプルして作る (UTC 0時起点)。
+2026-07-05に15分/1時間/4時間から上位足版へ変更 (バックテストで下位足は
+ノイズによる往復が多いと判明したため)。4時間足は1時間足をリサンプルして
+作る (UTC 0時起点)。
 出力: Discord通知 + reports/mtf.html (コミットせず Pages デプロイのみ)
 """
 from __future__ import annotations
@@ -30,7 +32,7 @@ logger = logging.getLogger(__name__)
 JST = timezone(timedelta(hours=9))
 WEBHOOK_ENV = "DISCORD_WEBHOOK_URL"
 
-TF_LABELS = [("m15", "15分"), ("h1", "1時間"), ("h4", "4時間")]
+TF_LABELS = [("h1", "1時間"), ("h4", "4時間"), ("d1", "日足")]
 ARROW = {"up": "↑", "down": "↓", "flat": "→"}
 MIN_BARS = 60  # EMA50の計算に必要な最低バー数
 
@@ -59,23 +61,23 @@ def _close(data: pd.DataFrame, ticker: str, single: bool) -> pd.Series | None:
 def analyze(uni: pd.DataFrame) -> pd.DataFrame:
     tickers = uni["ticker"].tolist()
     single = len(tickers) == 1
-    logger.info("15分足を取得中 (30日分)")
-    d15 = yf.download(tickers, period="30d", interval="15m", group_by="ticker",
+    logger.info("1時間足を取得中 (365日分)")
+    d1h = yf.download(tickers, period="365d", interval="1h", group_by="ticker",
                       auto_adjust=True, threads=True, progress=False)
-    logger.info("1時間足を取得中 (90日分)")
-    d1h = yf.download(tickers, period="90d", interval="1h", group_by="ticker",
+    logger.info("日足を取得中 (2年分)")
+    d1d = yf.download(tickers, period="2y", interval="1d", group_by="ticker",
                       auto_adjust=True, threads=True, progress=False)
 
     rows = []
     for _, u in uni.iterrows():
-        c15 = _close(d15, u["ticker"], single)
         c1h = _close(d1h, u["ticker"], single)
+        c1d = _close(d1d, u["ticker"], single)
         c4h = c1h.resample("4h").last().dropna() if c1h is not None else None
 
-        dirs = {"m15": _direction(c15), "h1": _direction(c1h), "h4": _direction(c4h)}
+        dirs = {"h1": _direction(c1h), "h4": _direction(c4h), "d1": _direction(c1d)}
         values = set(dirs.values())
         aligned = "買い" if values == {"up"} else ("売り" if values == {"down"} else "")
-        price = float(c15.iloc[-1]) if c15 is not None and len(c15) else None
+        price = float(c1h.iloc[-1]) if c1h is not None and len(c1h) else None
         rows.append({**u.to_dict(), **dirs, "aligned": aligned, "price": price})
     return pd.DataFrame(rows)
 
@@ -103,12 +105,12 @@ def send_discord(result: pd.DataFrame, stamp: str) -> bool:
         "🔴 売りそろい: " + ("、".join(sells) if sells else "なし"),
         "",
         "```",
-        "ペア      15分 1時間 4時間",
+        "ペア      1時間 4時間 日足",
     ]
     for _, r in result.iterrows():
         mark = " ◀" if r["aligned"] else ""
-        lines.append(f"{r['pair']:<9} {ARROW[r['m15']]}    {ARROW[r['h1']]}     "
-                     f"{ARROW[r['h4']]}{mark}")
+        lines.append(f"{r['pair']:<9} {ARROW[r['h1']]}     {ARROW[r['h4']]}     "
+                     f"{ARROW[r['d1']]}{mark}")
     lines.append("```")
 
     payload = {
@@ -158,7 +160,7 @@ def save_html(result: pd.DataFrame, stamp: str, output_dir: Path) -> Path:
   </div>
 </header>
 <section>
-  <h2>15分足・1時間足・4時間足のトレンド方向</h2>
+  <h2>1時間足・4時間足・日足のトレンド方向</h2>
   <p class="note">↑ = 終値 &gt; EMA20 &gt; EMA50 ／ ↓ = 終値 &lt; EMA20 &lt; EMA50 ／ → = 中立。3つそろったペアが売買候補</p>
   <div class="tblwrap"><table><thead>{head}</thead><tbody>{rows}</tbody></table></div>
 </section>
@@ -196,5 +198,5 @@ def run(args: argparse.Namespace) -> None:
     if cfg["notify"]["enabled"] and not args.no_notify:
         send_discord(result, stamp)
 
-    cols = ["pair", "m15", "h1", "h4", "aligned"]
+    cols = ["pair", "h1", "h4", "d1", "aligned"]
     print(result[cols].to_string(index=False))
