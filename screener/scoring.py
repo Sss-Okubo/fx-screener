@@ -1,7 +1,7 @@
-"""複合スコアリング: 各指標を全ペア内で偏差値化して重み付き合算する
+"""複合スコアリング: 各ペアを買い(ロング)・売り(ショート)の両方向で評価する
 
-スコアは「基軸通貨の買い(ロング)」の魅力度。低スコアはロングに不向きなだけで、
-逆方向(ショート)の妙味を意味する場合がある。
+各ペアを2行(買い/売り)に展開し、方向依存の指標は売り行で符号を反転してから
+全行まとめて偏差値化 → 重み付き合算する。ボラティリティは両方向共通。
 """
 from __future__ import annotations
 
@@ -22,6 +22,10 @@ CATEGORY_METRICS: dict[str, list[tuple[str, int]]] = {
     "momentum": [("ret_63d", 1), ("macd_hist", 1)],
     "stability": [("vol_60d", -1)],
 }
+
+# 売り行で符号を反転する方向依存の指標 (ボラティリティは方向に依らない)
+DIRECTIONAL_COLS = {"carry", "value_dev", "sma50_ratio", "sma200_ratio",
+                    "ret_63d", "macd_hist"}
 
 
 def _zscore(series: pd.Series) -> pd.Series:
@@ -58,24 +62,43 @@ def build_features(store: Store, universe: pd.DataFrame,
     return df
 
 
-def score(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """特徴量テーブルにカテゴリ別スコアと総合スコアを付与し、ランキングを返す"""
+def score(features: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """各ペアを買い/売りの2行に展開してスコアリングし、ランキングを返す。
+
+    表示列 (5年乖離・3ヶ月・RSI等) はペアの生の値のまま。方向の反転は
+    スコア計算時とスワップ表示用の carry_dir にのみ適用する。
+    """
     weights: dict[str, float] = cfg["weights"]
 
+    longs = features.copy()
+    longs["direction"], longs["dir"] = "買い", 1
+    shorts = features.copy()
+    shorts["direction"], shorts["dir"] = "売り", -1
+    df = pd.concat([longs, shorts], ignore_index=True)
+
+    # その方向で受け取る金利差 (プラス = スワップ受取の概算)。+0.0 で -0.0 表示を防ぐ
+    df["carry_dir"] = df["carry"] * df["dir"] + 0.0
+
     for cat, metrics in CATEGORY_METRICS.items():
-        zs = [_zscore(df[col]) * sign for col, sign in metrics]
+        zs = []
+        for col, sign in metrics:
+            eff = df[col] * df["dir"] if col in DIRECTIONAL_COLS else df[col]
+            zs.append(_zscore(eff) * sign)
         df[f"z_{cat}"] = pd.concat(zs, axis=1).mean(axis=1)
 
     df["composite"] = sum(df[f"z_{cat}"] * w for cat, w in weights.items())
 
-    # RSI過熱ペナルティ
-    overbought = df["rsi"] > cfg["rsi_overbought"]
-    df.loc[overbought, "composite"] -= cfg["rsi_penalty"] * sum(weights.values())
+    # RSI過熱ペナルティ: 買いは買われすぎ、売りは売られすぎで減点
+    over = (df["dir"] == 1) & (df["rsi"] > cfg["rsi_overbought"])
+    under = (df["dir"] == -1) & (df["rsi"] < 100 - cfg["rsi_overbought"])
+    df.loc[over | under, "composite"] -= cfg["rsi_penalty"] * sum(weights.values())
 
     # 表示用に偏差値 (50 + 10z) へ変換
     comp = df["composite"]
     df["score"] = 50 + 10 * (comp - comp.mean()) / comp.std(ddof=0)
 
     df = df.sort_values("score", ascending=False).reset_index(drop=True)
-    df["rank"] = df.index + 1
+    # 順位は方向内で 1 から振る
+    df["rank"] = df.groupby("direction")["score"] \
+                   .rank(ascending=False, method="first").astype(int)
     return df

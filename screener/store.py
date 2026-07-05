@@ -18,12 +18,13 @@ CREATE TABLE IF NOT EXISTS price_meta (
     ticker TEXT PRIMARY KEY,
     fetched_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS results (
+CREATE TABLE IF NOT EXISTS results2 (
     run_date TEXT NOT NULL,
     ticker TEXT NOT NULL,
+    direction TEXT NOT NULL,
     rank INTEGER,
     score REAL,
-    PRIMARY KEY (run_date, ticker)
+    PRIMARY KEY (run_date, ticker, direction)
 );
 """
 
@@ -65,24 +66,25 @@ class Store:
         df["date"] = pd.to_datetime(df["date"])
         return df.set_index("date")
 
-    # ---- 選定結果履歴 ----
+    # ---- 選定結果履歴 (方向別) ----
     def save_results(self, run_date: str, ranked: pd.DataFrame) -> None:
-        rows = [(run_date, r["ticker"], int(r["rank"]), float(r["score"]))
+        rows = [(run_date, r["ticker"], r["direction"], int(r["rank"]), float(r["score"]))
                 for _, r in ranked.iterrows()]
         with self.conn:
             self.conn.executemany(
-                "INSERT OR REPLACE INTO results VALUES (?,?,?,?)", rows)
+                "INSERT OR REPLACE INTO results2 VALUES (?,?,?,?,?)", rows)
 
-    def previous_top_tickers(self, before_date: str, top_n: int) -> set[str]:
+    def previous_top_keys(self, before_date: str, top_n: int) -> set[tuple[str, str]]:
+        """前回実行の方向別トップN。戻り値: {(ticker, direction)}"""
         row = self.conn.execute(
-            "SELECT MAX(run_date) FROM results WHERE run_date < ?",
+            "SELECT MAX(run_date) FROM results2 WHERE run_date < ?",
             (before_date,)).fetchone()
         if not row or not row[0]:
             return set()
         rows = self.conn.execute(
-            "SELECT ticker FROM results WHERE run_date = ? AND rank <= ?",
+            "SELECT ticker, direction FROM results2 WHERE run_date = ? AND rank <= ?",
             (row[0], top_n)).fetchall()
-        return {r[0] for r in rows}
+        return {(r[0], r[1]) for r in rows}
 
     def close(self) -> None:
         self.conn.close()

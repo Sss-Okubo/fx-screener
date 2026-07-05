@@ -100,6 +100,8 @@ STYLE = """
 .scr .zbar i.p { left: 50%; background: var(--pos); }
 .scr .zbar i.n { right: 50%; background: var(--neg); }
 .scr .zval { min-width: 3.2rem; color: var(--ink-2); font-size: .82rem; }
+.scr .cpos { color: var(--pos); font-weight: 600; }
+.scr .cneg { color: var(--neg); font-weight: 600; }
 .scr footer { color: var(--muted); font-size: .8rem; border-top: 1px solid var(--grid); padding-top: 1rem; }
 """
 
@@ -130,17 +132,26 @@ def _z_cell(z: float) -> str:
             f'<span class="zval">{z:+.2f}</span></div>')
 
 
-def _rank_rows(df: pd.DataFrame, new_tickers: set[str]) -> str:
+def _swap_cell(carry_dir: float) -> str:
+    if carry_dir > 0:
+        return f'<td class="cpos">{carry_dir:+.2f}% 受取</td>'
+    if carry_dir < 0:
+        return f'<td class="cneg">{carry_dir:+.2f}% 支払</td>'
+    return "<td>±0.00%</td>"
+
+
+def _rank_rows(df: pd.DataFrame, new_keys: set[tuple[str, str]]) -> str:
     rows = []
     for _, r in df.iterrows():
-        new = '<span class="new">NEW</span>' if r["ticker"] in new_tickers else ""
+        new = ('<span class="new">NEW</span>'
+               if (r["ticker"], r["direction"]) in new_keys else "")
         rows.append(
             f"<tr><td>{r['rank']}</td>"
             f'<td class="l"><strong>{html.escape(r["pair"])}</strong>{new}</td>'
             f'<td class="l name">{html.escape(str(r["name"]))}</td>'
             f'<td class="l"><span class="mkt">{r["market"]}</span></td>'
             f"<td>{_score_cell(r['score'])}</td>"
-            f"<td>{_f(r['carry'], digits=2, signed=True)}%</td>"
+            f"{_swap_cell(r['carry_dir'])}"
             f"<td>{_f(r['value_dev'], pct=True, signed=True)}</td>"
             f"<td>{_f(r['ret_63d'], pct=True, signed=True)}</td>"
             f"<td>{_f(r['vol_60d'], pct=True)}</td>"
@@ -149,12 +160,12 @@ def _rank_rows(df: pd.DataFrame, new_tickers: set[str]) -> str:
     return "".join(rows)
 
 
-def _rank_table(df: pd.DataFrame, new_tickers: set[str]) -> str:
+def _rank_table(df: pd.DataFrame, new_keys: set[tuple[str, str]]) -> str:
     head = ('<tr><th>順位</th><th class="l">ペア</th><th class="l">名称</th>'
-            '<th class="l">区分</th><th>スコア</th><th>金利差</th><th>5年乖離</th>'
+            '<th class="l">区分</th><th>スコア</th><th>金利差(スワップ)</th><th>5年乖離</th>'
             '<th>3ヶ月</th><th>年率ボラ</th><th>RSI</th></tr>')
     return (f'<div class="tblwrap"><table><thead>{head}</thead>'
-            f"<tbody>{_rank_rows(df, new_tickers)}</tbody></table></div>")
+            f"<tbody>{_rank_rows(df, new_keys)}</tbody></table></div>")
 
 
 def _breakdown_table(df: pd.DataFrame) -> str:
@@ -170,10 +181,11 @@ def _breakdown_table(df: pd.DataFrame) -> str:
 
 
 def build_body(ranked: pd.DataFrame, run_date: str, cfg: dict,
-               new_tickers: set[str], weights: dict[str, float],
+               new_keys: set[tuple[str, str]], weights: dict[str, float],
                rates_as_of: str) -> str:
     top_n = cfg["top_n"]
-    jpy = ranked[ranked["market"] == "円クロス"]
+    buy = ranked[ranked["direction"] == "買い"].sort_values("rank")
+    sell = ranked[ranked["direction"] == "売り"].sort_values("rank")
 
     chips = "".join(
         f'<span class="chip">{WEIGHT_LABELS[k]} {v * 100:.0f}%</span>'
@@ -185,30 +197,38 @@ def build_body(ranked: pd.DataFrame, run_date: str, cfg: dict,
   <h1>FXスクリーニング結果</h1>
   <div class="date">{run_date} 実行</div>
   <div class="stats">
-    <div class="stat"><div class="k">対象ペア</div><div class="v">{len(ranked)}</div></div>
-    <div class="stat"><div class="k">円クロス</div><div class="v">{len(jpy)}</div></div>
+    <div class="stat"><div class="k">対象ペア</div><div class="v">{len(buy)}</div></div>
+    <div class="stat"><div class="k">評価方向</div><div class="v" style="font-size:1rem">買い / 売り</div></div>
     <div class="stat"><div class="k">政策金利基準</div><div class="v" style="font-size:1rem">{rates_as_of}</div></div>
   </div>
   <div class="weights">{chips}</div>
 </header>
 <section>
-  <h2>総合ランキング (全ペア)</h2>
-  <p class="note">スコアは「基軸通貨の買い(ロング)」の魅力度。低スコアは売り方向の妙味を示す場合があります。</p>
-  {_rank_table(ranked, new_tickers)}
+  <h2>買い(ロング)ランキング</h2>
+  <p class="note">金利差はその方向で建てた場合の政策金利差。<span class="cpos">青 = スワップ受取(概算)</span> ／ <span class="cneg">赤 = 支払</span></p>
+  {_rank_table(buy, new_keys)}
 </section>
 <section>
-  <h2>スコア内訳 (トップ{top_n})</h2>
-  <p class="note">全ペア内での偏差 (右向き青 = 平均より良い ／ 左向き赤 = 悪い、±3で頭打ち)</p>
-  {_breakdown_table(ranked.head(top_n))}
+  <h2>売り(ショート)ランキング</h2>
+  {_rank_table(sell, new_keys)}
+</section>
+<section>
+  <h2>スコア内訳 (買いトップ{top_n})</h2>
+  <p class="note">偏差 (右向き青 = 平均より良い ／ 左向き赤 = 悪い、±3で頭打ち)</p>
+  {_breakdown_table(buy.head(top_n))}
+</section>
+<section>
+  <h2>スコア内訳 (売りトップ{top_n})</h2>
+  {_breakdown_table(sell.head(top_n))}
 </section>
 <footer>金利差は各国政策金利({rates_as_of}時点の設定値)の差であり、実際のスワップポイントとは異なります。本レポートは機械的なスクリーニング結果であり、投資助言ではありません。FXはレバレッジにより損失が拡大するリスクがあります。データ: Yahoo Finance (yfinance)</footer>
 </div></div>"""
 
 
 def build_page(ranked: pd.DataFrame, run_date: str, cfg: dict,
-               new_tickers: set[str], weights: dict[str, float],
+               new_keys: set[tuple[str, str]], weights: dict[str, float],
                rates_as_of: str) -> str:
-    body = build_body(ranked, run_date, cfg, new_tickers, weights, rates_as_of)
+    body = build_body(ranked, run_date, cfg, new_keys, weights, rates_as_of)
     return (
         "<!doctype html>\n<html lang=\"ja\">\n<head>\n"
         "<meta charset=\"utf-8\">\n"
@@ -220,11 +240,11 @@ def build_page(ranked: pd.DataFrame, run_date: str, cfg: dict,
 
 
 def save_html(ranked: pd.DataFrame, run_date: str, cfg: dict,
-              new_tickers: set[str], weights: dict[str, float],
+              new_keys: set[tuple[str, str]], weights: dict[str, float],
               rates_as_of: str, output_dir: str | Path) -> Path:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / "index.html"
-    path.write_text(build_page(ranked, run_date, cfg, new_tickers, weights, rates_as_of),
+    path.write_text(build_page(ranked, run_date, cfg, new_keys, weights, rates_as_of),
                     encoding="utf-8")
     return path

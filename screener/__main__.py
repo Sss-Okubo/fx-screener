@@ -41,15 +41,16 @@ def run(args: argparse.Namespace) -> None:
     # 4. 前回結果との比較 → レポート生成
     top_n = cfg["report"]["top_n"]
     rates_as_of = str(cfg["rates"]["as_of"])
-    prev_top = store.previous_top_tickers(run_date, top_n)
-    current_top = set(ranked.head(top_n)["ticker"])
-    new_tickers = current_top - prev_top if prev_top else set()
+    prev_top = store.previous_top_keys(run_date, top_n)
+    top_rows = ranked[ranked["rank"] <= top_n]
+    current_top = set(zip(top_rows["ticker"], top_rows["direction"]))
+    new_keys = current_top - prev_top if prev_top else set()
 
-    text = report.build_report(ranked, run_date, cfg["report"], new_tickers, rates_as_of)
+    text = report.build_report(ranked, run_date, cfg["report"], new_keys, rates_as_of)
     path = report.save_report(text, run_date, base / cfg["report"]["output_dir"])
     logger.info("レポートを保存: %s", path)
 
-    html_path = report_html.save_html(ranked, run_date, cfg["report"], new_tickers,
+    html_path = report_html.save_html(ranked, run_date, cfg["report"], new_keys,
                                       cfg["scoring"]["weights"], rates_as_of,
                                       base / cfg["report"]["output_dir"])
     logger.info("HTMLレポートを保存: %s", html_path)
@@ -58,13 +59,15 @@ def run(args: argparse.Namespace) -> None:
 
     # 5. 通知
     if cfg["notify"]["enabled"] and not args.no_notify:
-        notify.send_discord(ranked, run_date, top_n, new_tickers)
+        notify.send_discord(ranked, run_date, top_n, new_keys)
 
     store.close()
 
     # コンソールにもトップ表示
-    cols = ["rank", "pair", "name", "market", "score"]
-    print(ranked.head(top_n)[cols].to_string(index=False))
+    cols = ["rank", "direction", "pair", "name", "score"]
+    for direction in ["買い", "売り"]:
+        sub = ranked[ranked["direction"] == direction].sort_values("rank")
+        print(sub.head(top_n)[cols].to_string(index=False))
 
 
 def main() -> None:
