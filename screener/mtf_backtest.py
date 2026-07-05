@@ -1,12 +1,17 @@
-"""MTFそろいシグナルの売買検証
+"""MTFそろいシグナルの売買検証 (ルール変種の比較)
 
-ルール: 15分/1時間/4時間足のトレンドが3つそろったバーの終値で建て、
-そろいが崩れたバーの終値で決済 (買い→売りへ直接反転した場合はドテン)。
+エントリーは全変種共通: 15分/1時間/4時間足のトレンドが3つそろったバーの終値。
+比較する変種:
+- ① 元ルール: そろいが崩れたら即決済 (中立でも決済)
+- ② 出口=15分逆転: 15分足がポジションと逆方向になるまで保有 (中立では保有継続)
+- ③ 出口=1時間崩れ: 1時間足がポジション方向でなくなったら決済 (15分足は無視)
+- ④ ② + 入口フレッシュ: 直前2時間(8バー)以上そろいが無かった場合のみ新規エントリー
+- ⑤ ③ + 入口フレッシュ: 同上
 
 制約: yfinance の15分足は直近60日しか取得できないため、検証期間は約2ヶ月。
 1時間足は365日分を取得して 1時間/4時間足のEMAを十分にウォームアップさせる。
 進行中の1時間/4時間バーは、最新の15分終値でEMAを1ステップ仮更新して判定する
-(ライブ判定と同等の扱い)。
+(ライブ判定と同等の扱い)。建玉中は各変種の決済条件のみを監視する。
 """
 from __future__ import annotations
 
@@ -23,6 +28,15 @@ import yfinance as yf
 from . import universe
 
 logger = logging.getLogger(__name__)
+
+# (名称, 決済モード, 入口フレッシュ条件の最低非そろいバー数)
+VARIANTS: list[tuple[str, str, int]] = [
+    ("① 元ルール(崩れで即決済)", "align", 0),
+    ("② 出口=15分逆転", "m15", 0),
+    ("③ 出口=1時間崩れ", "h1", 0),
+    ("④ ②+入口フレッシュ(2h)", "m15", 8),
+    ("⑤ ③+入口フレッシュ(2h)", "h1", 8),
+]
 
 
 def _dirs_15m(c15: pd.Series) -> np.ndarray:
@@ -49,25 +63,38 @@ def _dirs_higher(c15: pd.Series, c1h: pd.Series, freq: str) -> np.ndarray:
                     np.where((p < e20) & (e20 < e50), -1, 0))
 
 
-def _simulate(c15: pd.Series, sig: np.ndarray, cost: float) -> list[dict]:
-    """そろいで建玉、崩れで決済。cost は往復コスト (小数)"""
-    trades: list[dict] = []
+def _simulate(c15: pd.Series, sig: np.ndarray, d15: np.ndarray, d1h: np.ndarray,
+              cost: float, exit_mode: str, fresh_bars: int) -> list[dict]:
     prices = c15.to_numpy(float)
     times = c15.index
+    trades: list[dict] = []
     pos, p_in, t_in = 0, 0.0, None
+    last_nz = -10 ** 9  # 直近で sig != 0 だったバーの位置
 
     for i in range(len(prices)):
         s = int(sig[i])
-        if pos != 0 and s != pos:
-            trades.append({
-                "entry": t_in, "exit": times[i], "side": pos,
-                "ret": (prices[i] / p_in - 1) * pos - cost,
-                "hours": (times[i] - t_in).total_seconds() / 3600,
-                "forced": False,
-            })
-            pos = 0
+        if pos != 0:
+            if exit_mode == "align":
+                ex = s != pos
+            elif exit_mode == "m15":
+                ex = d15[i] == -pos
+            else:  # h1
+                ex = d1h[i] != pos
+            if ex:
+                trades.append({
+                    "entry": t_in, "exit": times[i], "side": pos,
+                    "ret": (prices[i] / p_in - 1) * pos - cost,
+                    "hours": (times[i] - t_in).total_seconds() / 3600,
+                    "forced": False,
+                })
+                pos = 0
         if pos == 0 and s != 0:
-            pos, p_in, t_in = s, prices[i], times[i]
+            # 新規はそろいの初回バーのみ。フレッシュ条件は直前の非そろい期間で判定
+            run_start = i == 0 or int(sig[i - 1]) != s
+            if run_start and (i - last_nz - 1) >= fresh_bars:
+                pos, p_in, t_in = s, prices[i], times[i]
+        if s != 0:
+            last_nz = i
     if pos != 0:  # 期間末で強制決済
         trades.append({
             "entry": t_in, "exit": times[-1], "side": pos,
@@ -87,6 +114,18 @@ def _close(data: pd.DataFrame, ticker: str, single: bool) -> pd.Series | None:
         return None
 
 
+def _summary(trades: list[dict], cost: float) -> dict:
+    rets = np.array([t["ret"] for t in trades])
+    return {
+        "trades": len(trades),
+        "win": float((rets > 0).mean()) if len(rets) else float("nan"),
+        "avg_bp": float(rets.mean() * 10000) if len(rets) else float("nan"),
+        "total": float(rets.sum()),
+        "total_gross": float((rets + cost).sum()),
+        "hours": float(np.mean([t["hours"] for t in trades])) if trades else 0.0,
+    }
+
+
 def run(args: argparse.Namespace) -> None:
     base = Path(args.config).resolve().parent
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -103,8 +142,7 @@ def run(args: argparse.Namespace) -> None:
     d1h = yf.download(tickers, period="365d", interval="1h", group_by="ticker",
                       auto_adjust=True, threads=True, progress=False)
 
-    all_trades = []
-    per_pair = []
+    all_trades: dict[str, list[dict]] = {name: [] for name, _, _ in VARIANTS}
     period_start, period_end = None, None
     for _, u in uni.iterrows():
         c15 = _close(d15, u["ticker"], single)
@@ -115,80 +153,60 @@ def run(args: argparse.Namespace) -> None:
         period_start = min(period_start or c15.index[0], c15.index[0])
         period_end = max(period_end or c15.index[-1], c15.index[-1])
 
-        d_15 = _dirs_15m(c15)
-        d_1h = _dirs_higher(c15, c1h, "1h")
-        d_4h = _dirs_higher(c15, c1h, "4h")
-        sig = np.where((d_15 == 1) & (d_1h == 1) & (d_4h == 1), 1,
-                       np.where((d_15 == -1) & (d_1h == -1) & (d_4h == -1), -1, 0))
+        dir15 = _dirs_15m(c15)
+        dir1h = _dirs_higher(c15, c1h, "1h")
+        dir4h = _dirs_higher(c15, c1h, "4h")
+        sig = np.where((dir15 == 1) & (dir1h == 1) & (dir4h == 1), 1,
+                       np.where((dir15 == -1) & (dir1h == -1) & (dir4h == -1), -1, 0))
 
-        trades = _simulate(c15, sig, cost)
-        for t in trades:
-            t["pair"] = u["pair"]
-        all_trades += trades
+        for name, exit_mode, fresh in VARIANTS:
+            trades = _simulate(c15, sig, dir15, dir1h, cost, exit_mode, fresh)
+            for t in trades:
+                t["pair"] = u["pair"]
+            all_trades[name] += trades
 
-        if trades:
-            rets = np.array([t["ret"] for t in trades])
-            per_pair.append({
-                "pair": u["pair"], "trades": len(trades),
-                "win": float((rets > 0).mean()),
-                "avg": float(rets.mean()), "total": float(rets.sum()),
-                "hours": float(np.mean([t["hours"] for t in trades])),
-                "buys": sum(1 for t in trades if t["side"] == 1),
-            })
-
-    if not all_trades:
+    if not any(all_trades.values()):
         logger.error("トレードが1件も発生しませんでした")
         return
 
-    rets = np.array([t["ret"] for t in all_trades])
-    gross = rets + cost
-    n = len(rets)
-    summary = {
-        "trades": n,
-        "win": float((rets > 0).mean()),
-        "avg_bp": float(rets.mean() * 10000),
-        "total": float(rets.sum()),
-        "total_gross": float(gross.sum()),
-        "hours": float(np.mean([t["hours"] for t in all_trades])),
-    }
-
-    # レポート生成
-    out_dir = base / cfg["report"]["output_dir"]
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tdf = pd.DataFrame(all_trades)
-    tdf["side"] = tdf["side"].map({1: "買い", -1: "売り"})
-    csv_path = out_dir / f"mtf-backtest-trades-{run_date}.csv"
-    tdf.to_csv(csv_path, index=False, encoding="utf-8")
-
+    # 変種比較表
     lines = [
-        f"# MTFそろい売買検証 {run_date}",
+        f"# MTFそろい売買検証 (ルール変種比較) {run_date}",
         "",
-        "ルール: 15分/1時間/4時間足のEMAトレンドが3つそろったバーの終値で建て、崩れたバーの終値で決済。",
+        "エントリーは全変種共通: 3つの足がそろったバーの終値 (④⑤は直前2時間以上の非そろいが条件)。",
         f"検証期間: {period_start:%Y-%m-%d} 〜 {period_end:%Y-%m-%d} "
         f"(約{(period_end - period_start).days}日間 ／ yfinanceの15分足の上限)",
-        f"取引コスト: 往復 {args.cost_bp:.1f}bp (スプレッド想定) ／ 1トレード=固定ロット、リターンは単純合算",
+        f"取引コスト: 往復 {args.cost_bp:.1f}bp ／ 1トレード=固定ロット、リターンは単純合算",
         "",
-        "## 全体",
+        "## 変種比較 (全10ペア合算)",
         "",
-        "| 項目 | 値 |",
-        "|---|---:|",
-        f"| トレード数 | {summary['trades']} |",
-        f"| 勝率 | {summary['win'] * 100:.1f}% |",
-        f"| 平均リターン/トレード | {summary['avg_bp']:+.1f}bp |",
-        f"| 合計リターン (コスト後) | {summary['total'] * 100:+.2f}% |",
-        f"| 合計リターン (コスト前) | {summary['total_gross'] * 100:+.2f}% |",
-        f"| 平均保有時間 | {summary['hours']:.1f}時間 |",
-        "",
-        "## ペア別 (コスト後)",
-        "",
-        "| ペア | 回数 | 買/売 | 勝率 | 平均 | 合計 | 平均保有 |",
-        "|---|---:|---|---:|---:|---:|---:|",
+        "| 変種 | 回数 | 勝率 | 平均 | 合計(コスト後) | 合計(コスト前) | 平均保有 |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for p in sorted(per_pair, key=lambda x: -x["total"]):
+    best_name, best_total = None, -1e9
+    for name, _, _ in VARIANTS:
+        s = _summary(all_trades[name], cost)
+        if s["total"] > best_total:
+            best_name, best_total = name, s["total"]
         lines.append(
-            f"| {p['pair']} | {p['trades']} | {p['buys']}/{p['trades'] - p['buys']} "
-            f"| {p['win'] * 100:.0f}% | {p['avg'] * 10000:+.1f}bp "
-            f"| {p['total'] * 100:+.2f}% | {p['hours']:.1f}h |")
+            f"| {name} | {s['trades']} | {s['win'] * 100:.1f}% | {s['avg_bp']:+.1f}bp "
+            f"| {s['total'] * 100:+.2f}% | {s['total_gross'] * 100:+.2f}% "
+            f"| {s['hours']:.1f}h |")
+
+    # 最良変種のペア別内訳
+    best_trades = all_trades[best_name]
+    lines += ["", f"## ペア別内訳 (最良変種: {best_name} / コスト後)", "",
+              "| ペア | 回数 | 買/売 | 勝率 | 平均 | 合計 | 平均保有 |",
+              "|---|---:|---|---:|---:|---:|---:|"]
+    bdf = pd.DataFrame(best_trades)
+    for pair, g in bdf.groupby("pair"):
+        rets = g["ret"].to_numpy()
+        buys = int((g["side"] == 1).sum())
+        lines.append(
+            f"| {pair} | {len(g)} | {buys}/{len(g) - buys} "
+            f"| {(rets > 0).mean() * 100:.0f}% | {rets.mean() * 10000:+.1f}bp "
+            f"| {rets.sum() * 100:+.2f}% | {g['hours'].mean():.1f}h |")
+
     lines += [
         "",
         "## 注意事項",
@@ -196,9 +214,16 @@ def run(args: argparse.Namespace) -> None:
         "- **検証期間は約2ヶ月のみ** (yfinanceの15分足は直近60日が上限)。この期間の相場環境に強く依存し、統計的な確度は低い",
         "- 終値ベースの約定でスリッページ未考慮。スワップ損益も未考慮",
         "- 上位足の進行中バーは15分終値でEMAを仮更新して判定 (ライブ判定に近い扱いだが完全一致ではない)",
+        "- 建玉中は各変種の決済条件のみを監視し、逆方向のそろいが出ても決済条件を満たすまで保有",
         "- 期間末の未決済ポジションは最終バーで強制決済として集計",
         "- 過去の成績は将来の成果を保証しない。投資判断は自己責任で",
     ]
+    out_dir = base / cfg["report"]["output_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bdf_out = bdf.copy()
+    bdf_out["side"] = bdf_out["side"].map({1: "買い", -1: "売り"})
+    bdf_out.to_csv(out_dir / f"mtf-backtest-trades-{run_date}.csv",
+                   index=False, encoding="utf-8")
     md_path = out_dir / f"mtf-backtest-{run_date}.md"
     md_path.write_text("\n".join(lines), encoding="utf-8")
     logger.info("検証レポートを保存: %s", md_path)
