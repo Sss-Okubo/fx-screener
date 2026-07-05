@@ -3,13 +3,14 @@
 各時間足のトレンドを EMA で判定し、3つの足が同方向のペアを抽出する:
 - 上昇: 終値 > EMA20 > EMA50 ／ 下降: 終値 < EMA20 < EMA50 ／ それ以外は中立
 
-そろったペアには裁量チェックリスト5項目を自動判定し、全通過なら
+そろったペアには裁量チェックリストを自動判定し、全通過なら
 「🎯 エントリー候補」として通知する:
 ① そろいたて (4時間前の時点では同方向にそろっていなかった)
 ② 押し目圏 (1時間足終値がEMA20から0.5×ATR14以内)
-③ 過熱なし (日足BB±2σ以内 かつ 5年平均乖離が方向に対して15%以内)
 ④ スワップ受取方向 (config.yaml の政策金利差)
 ⑤ 48時間以内に重要指標なし (config.yaml の events + 毎月第1金曜=米雇用統計)
+※ ③過熱なし(日足±2σ・5年乖離)は2026-07-05にユーザー判断で条件から除外。
+  参考値として日足σ・5年乖離は🎯通知の詳細に表示し続ける
 
 2026-07-05に15分/1時間/4時間から上位足版へ変更 (バックテストで下位足は
 ノイズによる往復が多いと判明したため)。売買ルールではなく入り口発見用。
@@ -41,12 +42,10 @@ TF_LABELS = [("h1", "1時間"), ("h4", "4時間"), ("d1", "日足")]
 ARROW = {"up": "↑", "down": "↓", "flat": "→"}
 MIN_BARS = 60          # EMA50の計算に必要な最低バー数
 PULLBACK_ATR = 0.5     # ②: EMA20からの許容乖離 (ATR倍率)
-STRETCH_SIGMA = 2.0    # ③: 日足BBの許容σ
-STRETCH_DEV = 0.15     # ③: 5年平均乖離の許容幅 (方向に対して)
 EVENT_HOURS = 48       # ⑤: 指標前の回避時間
 CHECK_LABELS = [
     ("fresh", "①そろいたて"), ("pullback", "②押し目圏"),
-    ("calm", "③過熱なし"), ("swap", "④スワップ受取"), ("no_event", "⑤指標なし"),
+    ("swap", "④スワップ受取"), ("no_event", "⑤指標なし"),
 ]
 
 
@@ -124,18 +123,15 @@ def _checks(u: pd.Series, direction: str, df1h: pd.DataFrame, c1d: pd.Series,
     ema_dist_atr = abs(float(c1h.iloc[-1]) - ema20) / atr if atr > 0 else 99.0
     pullback = ema_dist_atr <= PULLBACK_ATR
 
-    # ③ 過熱なし: 日足BB±2σ以内 かつ 5年平均乖離が方向に対して15%以内
+    # (参考値) 日足BBのσ位置と5年平均乖離。③過熱なしは条件から除外済みだが表示は残す
     daily_z, value_dev = None, None
-    calm = True
     if len(c1d) >= MIN_BARS:
         sma = c1d.rolling(20).mean().iloc[-1]
         sd = c1d.rolling(20).std(ddof=0).iloc[-1]
         if pd.notna(sd) and sd > 0:
             daily_z = float((c1d.iloc[-1] - sma) / sd)
-            calm = calm and (daily_z * d <= STRETCH_SIGMA)
     if len(c1d) >= 750:
         value_dev = float(c1d.iloc[-1] / c1d.tail(1300).mean() - 1)
-        calm = calm and (value_dev * d <= STRETCH_DEV)
 
     # ④ スワップ受取方向
     carry_dir = (rates.get(u["base"], 0.0) - rates.get(u["quote"], 0.0)) * d
@@ -144,7 +140,7 @@ def _checks(u: pd.Series, direction: str, df1h: pd.DataFrame, c1d: pd.Series,
     # ⑤ 48時間以内に重要指標なし (全ペア共通)
     no_event = not events
 
-    checks = {"fresh": fresh, "pullback": pullback, "calm": calm,
+    checks = {"fresh": fresh, "pullback": pullback,
               "swap": swap, "no_event": no_event}
     return {
         **checks,
@@ -224,7 +220,7 @@ def send_discord(result: pd.DataFrame, stamp: str) -> bool:
             "title": f"🎯 エントリー候補 (チェックリスト全通過) {stamp}",
             "description": "\n".join(lines)[:4000],
             "color": 0xF1C40F,
-            "footer": {"text": "①そろいたて ②押し目圏 ③過熱なし ④スワップ受取 ⑤指標なし を全て満たしたペア。最終判断はご自身で。"},
+            "footer": {"text": "①そろいたて ②押し目圏 ④スワップ受取 ⑤指標なし を全て満たしたペア (日足σ・5年乖離は参考表示)。最終判断はご自身で。"},
         })
 
     # 通常のマトリクス
@@ -301,7 +297,7 @@ def save_html(result: pd.DataFrame, stamp: str, output_dir: Path) -> Path:
         check_section = f"""
 <section>
   <h2>エントリー前チェックリスト (そろい済みペア)</h2>
-  <p class="note">①4時間前は未そろい ／ ②1時間足EMA20から{PULLBACK_ATR}ATR以内 ／ ③日足±{STRETCH_SIGMA:.0f}σ以内かつ5年乖離{STRETCH_DEV * 100:.0f}%以内 ／ ④政策金利差が受取方向 ／ ⑤48時間以内に重要指標なし</p>
+  <p class="note">①4時間前は未そろい ／ ②1時間足EMA20から{PULLBACK_ATR}ATR以内 ／ ④政策金利差が受取方向 ／ ⑤48時間以内に重要指標なし (③過熱なしは条件から除外、日足σ・5年乖離は🎯通知に参考表示)</p>
   <div class="tblwrap"><table><thead>{chead}</thead><tbody>{''.join(crows)}</tbody></table></div>
 </section>"""
 
