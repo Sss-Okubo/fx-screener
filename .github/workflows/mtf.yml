@@ -2,8 +2,9 @@ name: MTF Trend Alignment
 
 on:
   schedule:
-    # 平日4時間ごと (UTC 0,4,8,12,16,20時 = JST 9,13,17,21,1,5時)
-    - cron: "0 */4 * * 1-5"
+    # 平日4時間ごと (UTC 1,5,9,13,17,21時 = JST 10,14,18,22,2,6時)
+    # 月曜のJST 2時・6時分はUTC日曜のため実行されない (市場がほぼ開いていない時間帯)
+    - cron: "0 1,5,9,13,17,21 * * 1-5"
   workflow_dispatch: {}  # 手動実行も可能
 
 permissions:
