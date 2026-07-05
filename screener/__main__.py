@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from . import fetch, notify, report, report_html, scoring, universe
+from . import backtest, fetch, notify, report, report_html, scoring, universe
 from .store import Store
 
 logger = logging.getLogger("screener")
@@ -82,6 +82,14 @@ def main() -> None:
     p_run.add_argument("--no-notify", action="store_true", help="通知を送らない")
     p_run.add_argument("--force-refresh", action="store_true", help="キャッシュを無視して再取得")
     p_run.set_defaults(func=run)
+
+    p_bt = sub.add_parser("backtest", help="選定ルールを過去データで検証")
+    p_bt.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
+    p_bt.add_argument("--years", type=int, default=5, help="検証年数 (デフォルト5年)")
+    p_bt.add_argument("--top", type=int, default=3, help="保有ポジション数 (デフォルト3)")
+    p_bt.add_argument("--limit", type=int, help="ペア数を制限 (テスト用)")
+    p_bt.add_argument("--force-refresh", action="store_true", help="キャッシュを無視して再取得")
+    p_bt.set_defaults(func=backtest.run)
 
     args = parser.parse_args()
     args.func(args)
