@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from . import backtest, fetch, mtf, notify, report, report_html, scoring, universe
+from . import backtest, fetch, mtf, mtf_backtest, notify, report, report_html, scoring, universe
 from .store import Store
 
 logger = logging.getLogger("screener")
@@ -96,6 +96,13 @@ def main() -> None:
     p_mtf.add_argument("--limit", type=int, help="ペア数を制限 (テスト用)")
     p_mtf.add_argument("--no-notify", action="store_true", help="通知を送らない")
     p_mtf.set_defaults(func=mtf.run)
+
+    p_mbt = sub.add_parser("mtf-backtest", help="MTFそろい売買ルールを過去60日で検証")
+    p_mbt.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
+    p_mbt.add_argument("--cost-bp", type=float, default=1.0,
+                       help="往復取引コスト (bp、デフォルト1.0)")
+    p_mbt.add_argument("--limit", type=int, help="ペア数を制限 (テスト用)")
+    p_mbt.set_defaults(func=mtf_backtest.run)
 
     args = parser.parse_args()
     args.func(args)
