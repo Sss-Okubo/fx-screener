@@ -37,3 +37,13 @@ report:
 notify:
   # Discord Webhook URL は環境変数 DISCORD_WEBHOOK_URL に設定する
   enabled: true
+
+events:
+  # 重要指標カレンダー (エントリー候補判定で「48時間以内に指標なし」のチェックに使う)。
+  # 米雇用統計 (毎月第1金曜) は自動判定なので書かなくてよい。
+  # 中銀会合などの日程が決まったらここに追記する。過去分は消してよい。
+  - { date: "2026-07-08", label: "FOMC議事要旨" }
+  - { date: "2026-07-14", label: "米CPI" }
+  - { date: "2026-07-23", label: "ECB理事会" }
+  - { date: "2026-07-29", label: "FOMC" }
+  - { date: "2026-07-30", label: "BOE金融政策委員会" }
