@@ -1,0 +1,41 @@
+# FXスクリーナー設定
+universe:
+  limit: null             # テスト用: ペア数を制限 (null = 全ペア)
+
+data:
+  db_path: data/fx.db
+  price_period: "6y"      # 5年平均乖離の計算に必要な期間
+  prices_cache_days: 1    # 価格データのキャッシュ有効日数
+
+rates:
+  # 各通貨の政策金利 (%)。キャリー(金利差)スコアの元データ。
+  # 中央銀行の利上げ・利下げがあったらここを手で更新する。
+  as_of: "2026-01"        # 目安値。最新の政策金利は各中銀の発表を確認すること
+  policy:
+    USD: 3.75             # FRB (FF金利 目標上限)
+    JPY: 0.75             # 日銀 (無担保コール翌日物)
+    EUR: 2.00             # ECB (預金ファシリティ金利)
+    GBP: 3.75             # BOE (バンクレート)
+    AUD: 3.60             # RBA (キャッシュレート)
+    NZD: 2.25             # RBNZ (OCR)
+    CAD: 2.25             # BOC (翌日物金利)
+    CHF: 0.00             # SNB (政策金利)
+
+scoring:
+  # 重み合計は 1.0 にすること (キャリー・割安重視の配分)
+  weights:
+    carry: 0.30       # 金利差 (買い方向のスワップ妙味)
+    value: 0.20       # 5年平均からの乖離 (低いほど割安)
+    trend: 0.20       # 50日/200日移動平均との乖離
+    momentum: 0.15    # 3ヶ月リターン / MACD
+    stability: 0.15   # 年率ボラティリティ (低いほど良い)
+  rsi_overbought: 75  # このRSIを超えたらペナルティ
+  rsi_penalty: 0.5    # ペナルティ量 (zスコア換算)
+
+report:
+  top_n: 5            # スコア内訳・通知の表示数 (ランキング表は全ペア表示)
+  output_dir: reports
+
+notify:
+  # Discord Webhook URL は環境変数 DISCORD_WEBHOOK_URL に設定する
+  enabled: true
