@@ -46,6 +46,9 @@ NAME_HALF = "⑧ 半分利確+中心線トレイル"
 NAME_H1 = "⑨ TP=BB3σ/SL=1.5ATR"
 NAME_H1_ALIGN = "⑩ そろい崩れで即決済"
 NAME_H1_REV = "⑪ 1時間足逆転まで保有"
+NAME_H1_BE05 = "⑫ ⑨+建値SL(+0.5ATRで移動)"
+NAME_H1_BE10 = "⑬ ⑨+建値SL(+1.0ATRで移動)"
+NAME_H1_BE15 = "⑭ ⑨+建値SL(+1.5ATRで移動)"
 BB_SPAN = 20      # ボリンジャーバンドの期間
 BB_SIGMA = 3.0    # 利確バンドのシグマ
 SL_PIPS = 30.0    # ⑥の損切: SMA20 からの逆行幅 (pips)
@@ -126,9 +129,10 @@ def _simulate(c15: pd.Series, sig: np.ndarray, d15: np.ndarray, d1h: np.ndarray,
 
 
 def _simulate_tp_sl(df: pd.DataFrame, sig: np.ndarray, pip: float, cost: float,
-                    sl_mode: str) -> list[dict]:
-    """⑥⑦⑨: 利確=BB+3σタッチ、損切=sl_mode ("sma30"=SMA20-30pipsトレーリング /
-    "atr"=建値−1.5×ATR固定)"""
+                    sl_mode: str, breakeven_atr: float | None = None) -> list[dict]:
+    """⑥⑦⑨⑫〜⑭: 利確=BB+3σタッチ、損切=sl_mode ("sma30"=SMA20-30pipsトレーリング /
+    "atr"=建値−1.5×ATR固定)。breakeven_atr を指定すると、建値から
+    その倍率×ATR だけ有利に進んだ次のバー以降、損切りを建値へ引き上げる"""
     c = df["Close"].to_numpy(float)
     o = df["Open"].to_numpy(float)
     h = df["High"].to_numpy(float)
@@ -140,7 +144,7 @@ def _simulate_tp_sl(df: pd.DataFrame, sig: np.ndarray, pip: float, cost: float,
     atr = _atr(df)
 
     trades: list[dict] = []
-    pos, p_in, t_in, i_in, stop0 = 0, 0.0, None, -1, 0.0
+    pos, p_in, t_in, i_in, stop0, atr_e = 0, 0.0, None, -1, 0.0, 0.0
 
     def close_trade(i, price, reason):
         nonlocal pos
@@ -158,30 +162,38 @@ def _simulate_tp_sl(df: pd.DataFrame, sig: np.ndarray, pip: float, cost: float,
                 stop = sma[i] - pos * SL_PIPS * pip
             else:
                 stop = stop0
+            sl_reason = "建値" if sl_mode == "atr" and stop0 == p_in else "損切"
             tp = upper[i] if pos == 1 else lower[i]
             if pos == 1:
                 if o[i] <= stop:
-                    close_trade(i, o[i], "損切")
+                    close_trade(i, o[i], sl_reason)
                 elif l[i] <= stop:
-                    close_trade(i, stop, "損切")
+                    close_trade(i, stop, sl_reason)
                 elif o[i] >= tp:
                     close_trade(i, o[i], "利確")
                 elif h[i] >= tp:
                     close_trade(i, tp, "利確")
             else:
                 if o[i] >= stop:
-                    close_trade(i, o[i], "損切")
+                    close_trade(i, o[i], sl_reason)
                 elif h[i] >= stop:
-                    close_trade(i, stop, "損切")
+                    close_trade(i, stop, sl_reason)
                 elif o[i] <= tp:
                     close_trade(i, o[i], "利確")
                 elif l[i] <= tp:
                     close_trade(i, tp, "利確")
+            # 建値ストップ: トリガー到達を確認 (発動は次バーの判定から)
+            if pos != 0 and breakeven_atr is not None and stop0 != p_in:
+                if pos == 1 and h[i] >= p_in + breakeven_atr * atr_e:
+                    stop0 = p_in
+                elif pos == -1 and l[i] <= p_in - breakeven_atr * atr_e:
+                    stop0 = p_in
         if pos == 0:
             s = int(sig[i])
             if s != 0 and (i == 0 or int(sig[i - 1]) != s) and not math.isnan(atr[i]):
                 pos, p_in, t_in, i_in = s, c[i], times[i], i
-                stop0 = p_in - s * ATR_MULT * atr[i]
+                atr_e = atr[i]
+                stop0 = p_in - s * ATR_MULT * atr_e
     if pos != 0:
         close_trade(len(c) - 1, c[-1], "強制")
     return trades
@@ -296,7 +308,8 @@ def run(args: argparse.Namespace) -> None:
                       auto_adjust=True, threads=True, progress=False)
 
     names_15m = [name for name, _, _ in VARIANTS] + [NAME_BB, NAME_ATR, NAME_HALF]
-    names_1h = [NAME_H1, NAME_H1_ALIGN, NAME_H1_REV]
+    names_1h = [NAME_H1, NAME_H1_ALIGN, NAME_H1_REV,
+                NAME_H1_BE05, NAME_H1_BE10, NAME_H1_BE15]
     names = names_15m + names_1h
     all_trades: dict[str, list[dict]] = {name: [] for name in names}
     period_start, period_end = None, None
@@ -350,6 +363,9 @@ def run(args: argparse.Namespace) -> None:
                 (NAME_H1, _simulate_tp_sl(df1h, sig1h, pip, cost, "atr")),
                 (NAME_H1_ALIGN, _simulate(c1h, sig1h, dh1, dh4, cost, "align", 0)),
                 (NAME_H1_REV, _simulate(c1h, sig1h, dh1, dh4, cost, "m15", 0)),
+                (NAME_H1_BE05, _simulate_tp_sl(df1h, sig1h, pip, cost, "atr", 0.5)),
+                (NAME_H1_BE10, _simulate_tp_sl(df1h, sig1h, pip, cost, "atr", 1.0)),
+                (NAME_H1_BE15, _simulate_tp_sl(df1h, sig1h, pip, cost, "atr", 1.5)),
             ]:
                 for t in trades:
                     t["pair"] = u["pair"]
