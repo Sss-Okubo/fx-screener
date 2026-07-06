@@ -5,7 +5,7 @@
 
 そろったペアには裁量チェックリストを自動判定し、全通過なら
 「🎯 エントリー候補」として通知する:
-① そろいたて (4時間前の時点では同方向にそろっていなかった)
+① そろいたて (そろい始めてから24時間以内)
 ② 押し目圏 (1時間足終値がEMA20から0.5×ATR14以内)
 ④ スワップ受取方向 (config.yaml の政策金利差)
 ⑤ 48時間以内に重要指標なし (config.yaml の events + 毎月第1金曜=米雇用統計)
@@ -42,6 +42,7 @@ TF_LABELS = [("h1", "1時間"), ("h4", "4時間"), ("d1", "日足")]
 ARROW = {"up": "↑", "down": "↓", "flat": "→"}
 MIN_BARS = 60          # EMA50の計算に必要な最低バー数
 PULLBACK_ATR = 0.5     # ②: EMA20からの許容乖離 (ATR倍率)
+FRESH_HOURS = 24       # ①: そろい始めからこの時間以内なら「そろいたて」
 EVENT_HOURS = 48       # ⑤: 指標前の回避時間
 CHECK_LABELS = [
     ("fresh", "①そろいたて"), ("pullback", "②押し目圏"),
@@ -108,14 +109,23 @@ def _checks(u: pd.Series, direction: str, df1h: pd.DataFrame, c1d: pd.Series,
     d = 1 if direction == "買い" else -1
     c1h = df1h["Close"]
 
-    # ① そろいたて: 4時間前 (1時間足4本前) の時点では同方向にそろっていなかった
-    c1h_prev = c1h.iloc[:-4]
-    prev_dirs = {
-        "h1": _direction(c1h_prev),
-        "h4": _direction(c1h_prev.resample("4h").last().dropna()),
-        "d1": _direction(c1d),  # 日足は4時間では実質変わらないため近似
-    }
-    fresh = _aligned(prev_dirs) != direction
+    # ① そろいたて: 過去24時間 (1時間足24本) 以内にそろい始めた
+    #    1本ずつ遡り、同方向のそろいが崩れる時点が24本以内に見つかれば○
+    fresh = False
+    for k in range(1, FRESH_HOURS + 1):
+        c1h_t = c1h.iloc[:-k]
+        if len(c1h_t) < MIN_BARS:
+            break
+        last_date = c1h_t.index[-1].date()
+        c1d_t = c1d[[d_ <= last_date for d_ in c1d.index.date]]
+        prev_dirs = {
+            "h1": _direction(c1h_t),
+            "h4": _direction(c1h_t.resample("4h").last().dropna()),
+            "d1": _direction(c1d_t),
+        }
+        if _aligned(prev_dirs) != direction:
+            fresh = True
+            break
 
     # ② 押し目圏: 1時間足終値が EMA20 から 0.5×ATR14 以内
     ema20 = float(c1h.ewm(span=20, adjust=False).mean().iloc[-1])
@@ -297,7 +307,7 @@ def save_html(result: pd.DataFrame, stamp: str, output_dir: Path) -> Path:
         check_section = f"""
 <section>
   <h2>エントリー前チェックリスト (そろい済みペア)</h2>
-  <p class="note">①4時間前は未そろい ／ ②1時間足EMA20から{PULLBACK_ATR}ATR以内 ／ ④政策金利差が受取方向 ／ ⑤48時間以内に重要指標なし (③過熱なしは条件から除外、日足σ・5年乖離は🎯通知に参考表示)</p>
+  <p class="note">①そろい始めから{FRESH_HOURS}時間以内 ／ ②1時間足EMA20から{PULLBACK_ATR}ATR以内 ／ ④政策金利差が受取方向 ／ ⑤48時間以内に重要指標なし (③過熱なしは条件から除外、日足σ・5年乖離は🎯通知に参考表示)</p>
   <div class="tblwrap"><table><thead>{chead}</thead><tbody>{''.join(crows)}</tbody></table></div>
 </section>"""
 
